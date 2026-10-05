@@ -1,0 +1,67 @@
+name: Setup Synopsys environment
+description: Export Synopsys tools, license, and PDK environment variables.
+
+runs:
+  using: composite
+  steps:
+    - name: Export Synopsys environment
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        vc_static_home=/home/ec2-user/synopsys/vc_static/X-2025.06-SP2-1
+        echo "Using VC Static from ${vc_static_home}"
+
+        {
+          echo "SYNOPSYS_BASE=/home/ec2-user/synopsys"
+          echo "SNPSLMD_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+          echo "LM_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+          echo "SFTLMD_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+          echo "FLEXLM_DIAGNOSTICS=3"
+
+          echo "FINESIM_HOME=/home/ec2-user/synopsys/finesim/W-2024.09-SP2-2"
+          echo "VCS_HOME=/home/ec2-user/synopsys/vcs/W-2024.09"
+          echo "VERDI_HOME=/home/ec2-user/synopsys/verdi/W-2024.09-1"
+          echo "HSIM_HOME=/home/ec2-user/synopsys/hsim/2024.06/hsimplus"
+          echo "HSPICE_HOME=/home/ec2-user/synopsys/hspice/W-2024.09-SP2-2/hspice"
+          echo "PRIMESIM_HOME=/home/ec2-user/synopsys/primesim/W-2024.09-SP2-2"
+          echo "XA_HOME=/home/ec2-user/synopsys/xa/W-2024.09-SP2-2"
+          echo "VC_STATIC_HOME=${vc_static_home}"
+          echo "ICV_HOME_DIR=/home/ec2-user/synopsys/icvalidator/W-2024.09-SP5"
+          echo "SFT_ROOT=/home/ec2-user/synopsys/sft/W-2024.09-SP5-1"
+
+          echo "LD_LIBRARY_PATH=/home/ec2-user/synopsys/sft/W-2024.09-SP5-1/plat/xlib/Linux4.x-x86_64:${LD_LIBRARY_PATH:-}"
+          echo "SYNOPSYS_PRIMEWAVE_ENABLE_THIRDPARTY=1"
+          echo "PRIMESIM=1"
+
+          echo "PDK_INSTALL_PATH=/home/centos/pdk_files/65MSRFLP/PDK/TSMCiPDK/tn65cmsp007w1_1_7c"
+          echo "PDK_INSTALL_PATH_GP=/home/centos/pdk_files/65MSRFGP/PDK/TSMCiPDK/tn65cmsp018w1_1_0c"
+        } >> "$GITHUB_ENV"
+
+        {
+          echo "/usr/local/go/bin"
+          echo "/home/ec2-user/synopsys/hspice/W-2024.09-SP2-2/hspice/bin"
+          echo "/home/ec2-user/synopsys/xa/W-2024.09-SP2-2/bin"
+          echo "/home/ec2-user/synopsys/verdi/W-2024.09-1/bin"
+          echo "/home/ec2-user/synopsys/finesim/W-2024.09-SP2-2/bin"
+          echo "/home/ec2-user/synopsys/hsim/2024.06/hsimplus/bin"
+          echo "/home/ec2-user/synopsys/icvalidator/W-2024.09-SP5/bin"
+          echo "/home/ec2-user/synopsys/primesim/W-2024.09-SP2-2/bin"
+          echo "${vc_static_home}/bin"
+          echo "/home/ec2-user/synopsys/vcs/W-2024.09/bin"
+          echo "/home/ec2-user/synopsys/execman/W-2024.09-SP2-2/bin"
+          echo "/home/ec2-user/synopsys/icc2/W-2024.09-SP3/bin"
+          echo "/home/ec2-user/synopsys/icc/W-2024.09-SP2/bin"
+          echo "/home/ec2-user/synopsys/wv/W-2024.09-3/bin"
+          echo "/home/ec2-user/synopsys/mw/W-2024.09-SP2/bin"
+          echo "/home/ec2-user/synopsys/customcompiler/W-2024.09-3/bin"
+          echo "/home/ec2-user/synopsys/starrc/W-2024.09-SP5/bin"
+          echo "/home/ec2-user/synopsys/primewavereliability/2024.06/bin"
+          echo "/home/ec2-user/synopsys/primewave/W-2024.09-3/bin"
+          echo "/home/ec2-user/synopsys/icv_workbench/W-2024.09-SP2/bin"
+          echo "/home/ec2-user/synopsys/syn/W-2024.09-SP5-1/bin"
+          echo "/home/ec2-user/synopsys/fm/W-2024.09-SP5/bin"
+          echo "/home/ec2-user/synopsys/verdi_supp/W-2024.09-1/bin"
+          echo "/home/ec2-user/synopsys/prime/W-2024.09-SP5/bin"
+          echo "/home/ec2-user/synopsys/sft/W-2024.09-SP5-1/bin"
+        } >> "$GITHUB_PATH"

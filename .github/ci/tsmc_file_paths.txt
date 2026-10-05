@@ -1,0 +1,8 @@
+# One canonical TSMC-related file path per line.
+# These paths are used to warn when a known TSMC filename is referenced from a different location.
+/home/centos/SClib/tcbn65lp_220a/FE/TSMCHOME/TSMCHOME/digital/Front_End/verilog/tcbn65lp_200a/tcbn65lp.v
+/home/centos/SClib/tcbn65lphvt_220a/FE/TSMCHOME/TSMCHOME/digital/Front_End/verilog/tcbn65lphvt_200a/tcbn65lphvt.v
+/home/centos/SClib/tcbn65lp_220a/FE/TSMCHOME/TSMCHOME/digital/Front_End/timing_power_noise/CCS/tcbn65lp_200a/tcbn65lpwc0d9_ccs.db
+/home/centos/SClib/tcbn65lphvt_220a/FE/TSMCHOME/TSMCHOME/digital/Front_End/timing_power_noise/CCS/tcbn65lphvt_200a/tcbn65lphvtwc0d9_ccs.db
+/home/centos/SClib/SClib_cg/tcbn65lpcghvt_220a/tcbn65lpcghvt_200a_ccs/TSMCHOME/digital/Front_End/timing_power_noise/CCS/tcbn65lpcghvt_200a/tcbn65lpcghvtwc0d9_ccs.db
+/home/centos/SClib/tcbn65lphvt_220a/FE/TSMCHOME/TSMCHOME/digital/Front_End/timing_power_noise/CCS/tcbn65lphvt_200a/tcbn65lphvtwc0d90d9_ccs.db

@@ -1,0 +1,3 @@
+# One absolute installed-source file or directory per line.
+/home/centos/SClib/tcbn65lp_220a/FE/TSMCHOME/TSMCHOME/digital/Front_End/verilog/tcbn65lp_200a/tcbn65lp.v
+/home/centos/SClib/tcbn65lphvt_220a/FE/TSMCHOME/TSMCHOME/digital/Front_End/verilog/tcbn65lphvt_200a/tcbn65lphvt.v

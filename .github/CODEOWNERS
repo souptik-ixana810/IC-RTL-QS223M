@@ -1,0 +1,10 @@
+# Replace these with real GitHub users/teams in your org.
+# Format: @org/team or @username
+
+# Default owner for everything in the repo
+* @Quasistatics/rtl-admins
+
+# RTL ownership for design and tests (or repo maintainers)
+design/ @Quasistatics/rtl-approvers @Quasistatics/rtl-admins
+
+test/ @Quasistatics/rtl-approvers @Quasistatics/rtl-admins

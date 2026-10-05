@@ -1,0 +1,648 @@
+name: IC RTL PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      synthesis_settings:
+        description: "Optional comma-separated settings; example: hvt,lvt,hvt_svt. Leave empty to use each module Makefile's DEFAULT_SETTINGS."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  checks: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  LOG_DIR: .ci-logs
+  RUNNER_LABEL: vcsr-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  initial-checks:
+    name: Initial checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare initial checks
+        shell: bash
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+          SUBMODULE_TOKEN: ${{ secrets.RUNNER_CFG_PAT }}
+        run: |
+          set -euo pipefail
+          git init "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          clean_origin_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_origin_url="https://x-access-token:${CHECKOUT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          trap 'git remote set-url origin "$clean_origin_url" >/dev/null 2>&1 || true' EXIT
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$auth_origin_url"
+          else
+            git remote add origin "$auth_origin_url"
+          fi
+          git config --local filter.lfs.required false
+          git config --local filter.lfs.smudge cat
+          git config --local filter.lfs.clean cat
+          git config --local filter.lfs.process ""
+          git fetch --no-tags --prune --depth 1 origin "+${GITHUB_REF}:refs/remotes/origin/ci-checkout"
+          git checkout --force --detach refs/remotes/origin/ci-checkout
+          base_sha="$(python3 -c 'import json,os; print(json.load(open(os.environ["GITHUB_EVENT_PATH"])).get("pull_request",{}).get("base",{}).get("sha",""))')"
+          if [ -n "$base_sha" ]; then
+            git fetch --no-tags --depth 1 origin "$base_sha"
+            git diff --name-only "$base_sha" HEAD > .git/ci-changed-files.txt
+          fi
+          git clean -ffdx
+
+          git -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="https://github.com/" \
+              -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="git@github.com:" \
+              -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="ssh://git@github.com/" \
+              submodule update --init --recursive
+          git remote set-url origin "$clean_origin_url"
+
+      - name: Run initial checks
+        shell: bash
+        run: |
+          python3 .github/ci/initial_checks.py --summary "$GITHUB_STEP_SUMMARY"
+
+  provision:
+    name: Provision EC2 runner
+    needs: initial-checks
+    runs-on: ubuntu-latest
+    outputs:
+      runner_label: ${{ steps.start.outputs.label }}
+      ec2_instance_id: ${{ steps.start.outputs.ec2-instance-id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Start EC2 runner
+        id: start
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: start
+          github-token: ${{ secrets.RUNNER_CFG_PAT }}
+          ec2-image-id: ${{ vars.VCS_RUNNER_AMI_ID }}
+          ec2-instance-type: ${{ vars.VCS_RUNNER_INSTANCE_TYPE || 'c5.4xlarge' }}
+          subnet-id: ${{ vars.RUNNER_SUBNET_ID }}
+          security-group-id: ${{ vars.RUNNER_SG_ID }}
+          label: ${{ env.RUNNER_LABEL }}
+          pre-runner-script: |
+            set -euo pipefail
+            efs_mount=/mnt/efs
+            legacy_rtl=/rtl/prev_ic
+            efs_legacy_rtl=${efs_mount}/rtl/prev_ic
+            vc_static_mount=/home/ec2-user/synopsys/vc_static/X-2025.06-SP2-1
+            efs_vc_static=/home/ec2-user/synopsys/vc_static/X-2025.06-SP2-1
+
+            sudo mkdir -p "${efs_mount}" "${vc_static_mount}" /rtl
+            if ! mountpoint -q "${efs_mount}"; then
+              sudo mount -t nfs4 \
+                -o ro,nosuid,nodev,noexec,vers=4.1 \
+                fs-0e02e7a5a97541855.efs.ap-south-1.amazonaws.com:/ \
+                "${efs_mount}"
+            fi
+
+            if ! mountpoint -q "${vc_static_mount}"; then
+              sudo mount -t nfs4 \
+                -o ro,nosuid,nodev,exec,vers=4.1 \
+                fs-0e02e7a5a97541855.efs.ap-south-1.amazonaws.com:${efs_vc_static} \
+                "${vc_static_mount}"
+            fi
+
+            if [[ -e "${legacy_rtl}" && ! -L "${legacy_rtl}" ]]; then
+              sudo rmdir "${legacy_rtl}"
+            fi
+            sudo ln -sfn "${efs_legacy_rtl}" "${legacy_rtl}"
+            sudo -u ec2-user test -r "${legacy_rtl}/qs222/spi_slave/sync_resetn_upf.v"
+            sudo -u ec2-user test -x "${vc_static_mount}/bin/vc_static_shell"
+
+  compile:
+    name: Compile
+    needs: provision
+    runs-on: [self-hosted, "${{ needs.provision.outputs.runner_label }}"]
+    steps:
+      - name: Prepare compile checks
+        shell: bash
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+          SUBMODULE_TOKEN: ${{ secrets.RUNNER_CFG_PAT }}
+        run: |
+          set -euo pipefail
+
+          git init "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          clean_origin_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_origin_url="https://x-access-token:${CHECKOUT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          trap 'git remote set-url origin "$clean_origin_url" >/dev/null 2>&1 || true' EXIT
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$auth_origin_url"
+          else
+            git remote add origin "$auth_origin_url"
+          fi
+          git config --local filter.lfs.required false
+          git config --local filter.lfs.smudge cat
+          git config --local filter.lfs.clean cat
+          git config --local filter.lfs.process ""
+          git fetch --no-tags --prune origin "+${GITHUB_REF}:refs/remotes/origin/ci-checkout"
+          git checkout --force --detach refs/remotes/origin/ci-checkout
+          git clean -ffdx
+
+          git -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="https://github.com/" \
+              -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="git@github.com:" \
+              -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="ssh://git@github.com/" \
+              submodule update --init --recursive
+
+          mkdir -p .ci
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+            git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" > .ci/changed_files.txt
+            echo "Changed files:"
+            sed 's/^/  /' .ci/changed_files.txt
+          fi
+          git remote set-url origin "$clean_origin_url"
+
+          vc_static_home=/home/ec2-user/synopsys/vc_static/X-2025.06-SP2-1
+          echo "Using VC Static from ${vc_static_home}"
+
+          synopsys_paths=(
+            /usr/local/go/bin
+            /home/ec2-user/synopsys/hspice/W-2024.09-SP2-2/hspice/bin
+            /home/ec2-user/synopsys/xa/W-2024.09-SP2-2/bin
+            /home/ec2-user/synopsys/verdi/W-2024.09-1/bin
+            /home/ec2-user/synopsys/finesim/W-2024.09-SP2-2/bin
+            /home/ec2-user/synopsys/hsim/2024.06/hsimplus/bin
+            /home/ec2-user/synopsys/icvalidator/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/primesim/W-2024.09-SP2-2/bin
+            "${vc_static_home}/bin"
+            /home/ec2-user/synopsys/vcs/W-2024.09/bin
+            /home/ec2-user/synopsys/execman/W-2024.09-SP2-2/bin
+            /home/ec2-user/synopsys/icc2/W-2024.09-SP3/bin
+            /home/ec2-user/synopsys/icc/W-2024.09-SP2/bin
+            /home/ec2-user/synopsys/wv/W-2024.09-3/bin
+            /home/ec2-user/synopsys/mw/W-2024.09-SP2/bin
+            /home/ec2-user/synopsys/customcompiler/W-2024.09-3/bin
+            /home/ec2-user/synopsys/starrc/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/primewavereliability/2024.06/bin
+            /home/ec2-user/synopsys/primewave/W-2024.09-3/bin
+            /home/ec2-user/synopsys/icv_workbench/W-2024.09-SP2/bin
+            /home/ec2-user/synopsys/syn/W-2024.09-SP5-1/bin
+            /home/ec2-user/synopsys/fm/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/verdi_supp/W-2024.09-1/bin
+            /home/ec2-user/synopsys/prime/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/sft/W-2024.09-SP5-1/bin
+          )
+
+          {
+            echo "SYNOPSYS_BASE=/home/ec2-user/synopsys"
+            echo "SNPSLMD_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+            echo "LM_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+            echo "SFTLMD_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+            echo "FLEXLM_DIAGNOSTICS=3"
+            echo "FINESIM_HOME=/home/ec2-user/synopsys/finesim/W-2024.09-SP2-2"
+            echo "VCS_HOME=/home/ec2-user/synopsys/vcs/W-2024.09"
+            echo "VERDI_HOME=/home/ec2-user/synopsys/verdi/W-2024.09-1"
+            echo "HSIM_HOME=/home/ec2-user/synopsys/hsim/2024.06/hsimplus"
+            echo "HSPICE_HOME=/home/ec2-user/synopsys/hspice/W-2024.09-SP2-2/hspice"
+            echo "PRIMESIM_HOME=/home/ec2-user/synopsys/primesim/W-2024.09-SP2-2"
+            echo "XA_HOME=/home/ec2-user/synopsys/xa/W-2024.09-SP2-2"
+            echo "VC_STATIC_HOME=${vc_static_home}"
+            echo "ICV_HOME_DIR=/home/ec2-user/synopsys/icvalidator/W-2024.09-SP5"
+            echo "SFT_ROOT=/home/ec2-user/synopsys/sft/W-2024.09-SP5-1"
+            echo "LD_LIBRARY_PATH=/home/ec2-user/synopsys/sft/W-2024.09-SP5-1/plat/xlib/Linux4.x-x86_64:${LD_LIBRARY_PATH:-}"
+            echo "SYNOPSYS_PRIMEWAVE_ENABLE_THIRDPARTY=1"
+            echo "PRIMESIM=1"
+            echo "PDK_INSTALL_PATH=/home/centos/pdk_files/65MSRFLP/PDK/TSMCiPDK/tn65cmsp007w1_1_7c"
+            echo "PDK_INSTALL_PATH_GP=/home/centos/pdk_files/65MSRFGP/PDK/TSMCiPDK/tn65cmsp018w1_1_0c"
+          } >> "$GITHUB_ENV"
+
+          printf '%s\n' "${synopsys_paths[@]}" >> "$GITHUB_PATH"
+          export PATH="$(IFS=:; echo "${synopsys_paths[*]}"):$PATH"
+          command -v vcs || true
+          command -v vlogan || true
+          command -v urg || true
+          command -v make || true
+          command -v python3 || true
+
+      - name: Discover and run compile checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/ci/run_compile_matrix.py \
+            --all \
+            --max-parallel 8 \
+            --log-dir "$LOG_DIR" \
+            --warnings-as-errors .github/ci/warnings_as_errors.txt \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload compile logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-logs
+          path: |
+            ${{ env.LOG_DIR }}/
+            test/**/sim/**/${{ env.LOG_DIR }}/
+          if-no-files-found: warn
+          include-hidden-files: true
+
+  lint:
+    name: Lint and CDC
+    needs: [provision, compile]
+    runs-on: [self-hosted, "${{ needs.provision.outputs.runner_label }}"]
+    steps:
+      - name: Prepare lint checks
+        shell: bash
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+          SUBMODULE_TOKEN: ${{ secrets.RUNNER_CFG_PAT }}
+        run: |
+          set -euo pipefail
+
+          git init "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          clean_origin_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_origin_url="https://x-access-token:${CHECKOUT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          trap 'git remote set-url origin "$clean_origin_url" >/dev/null 2>&1 || true' EXIT
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$auth_origin_url"
+          else
+            git remote add origin "$auth_origin_url"
+          fi
+          git config --local filter.lfs.required false
+          git config --local filter.lfs.smudge cat
+          git config --local filter.lfs.clean cat
+          git config --local filter.lfs.process ""
+          git fetch --no-tags --prune origin "+${GITHUB_REF}:refs/remotes/origin/ci-checkout"
+          git checkout --force --detach refs/remotes/origin/ci-checkout
+          git clean -ffdx
+
+          git -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="https://github.com/" \
+              -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="git@github.com:" \
+              -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="ssh://git@github.com/" \
+              submodule update --init --recursive
+
+          mkdir -p .ci
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+            git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" > .ci/changed_files.txt
+            echo "Changed files:"
+            sed 's/^/  /' .ci/changed_files.txt
+          fi
+          git remote set-url origin "$clean_origin_url"
+
+          vc_static_home=/home/ec2-user/synopsys/vc_static/X-2025.06-SP2-1
+          echo "Using VC Static from ${vc_static_home}"
+
+          synopsys_paths=(
+            /usr/local/go/bin
+            /home/ec2-user/synopsys/hspice/W-2024.09-SP2-2/hspice/bin
+            /home/ec2-user/synopsys/xa/W-2024.09-SP2-2/bin
+            /home/ec2-user/synopsys/verdi/W-2024.09-1/bin
+            /home/ec2-user/synopsys/finesim/W-2024.09-SP2-2/bin
+            /home/ec2-user/synopsys/hsim/2024.06/hsimplus/bin
+            /home/ec2-user/synopsys/icvalidator/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/primesim/W-2024.09-SP2-2/bin
+            "${vc_static_home}/bin"
+            /home/ec2-user/synopsys/vcs/W-2024.09/bin
+            /home/ec2-user/synopsys/execman/W-2024.09-SP2-2/bin
+            /home/ec2-user/synopsys/icc2/W-2024.09-SP3/bin
+            /home/ec2-user/synopsys/icc/W-2024.09-SP2/bin
+            /home/ec2-user/synopsys/wv/W-2024.09-3/bin
+            /home/ec2-user/synopsys/mw/W-2024.09-SP2/bin
+            /home/ec2-user/synopsys/customcompiler/W-2024.09-3/bin
+            /home/ec2-user/synopsys/starrc/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/primewavereliability/2024.06/bin
+            /home/ec2-user/synopsys/primewave/W-2024.09-3/bin
+            /home/ec2-user/synopsys/icv_workbench/W-2024.09-SP2/bin
+            /home/ec2-user/synopsys/syn/W-2024.09-SP5-1/bin
+            /home/ec2-user/synopsys/fm/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/verdi_supp/W-2024.09-1/bin
+            /home/ec2-user/synopsys/prime/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/sft/W-2024.09-SP5-1/bin
+          )
+
+          {
+            echo "SYNOPSYS_BASE=/home/ec2-user/synopsys"
+            echo "SNPSLMD_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+            echo "LM_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+            echo "SFTLMD_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+            echo "FLEXLM_DIAGNOSTICS=3"
+            echo "FINESIM_HOME=/home/ec2-user/synopsys/finesim/W-2024.09-SP2-2"
+            echo "VCS_HOME=/home/ec2-user/synopsys/vcs/W-2024.09"
+            echo "VERDI_HOME=/home/ec2-user/synopsys/verdi/W-2024.09-1"
+            echo "HSIM_HOME=/home/ec2-user/synopsys/hsim/2024.06/hsimplus"
+            echo "HSPICE_HOME=/home/ec2-user/synopsys/hspice/W-2024.09-SP2-2/hspice"
+            echo "PRIMESIM_HOME=/home/ec2-user/synopsys/primesim/W-2024.09-SP2-2"
+            echo "XA_HOME=/home/ec2-user/synopsys/xa/W-2024.09-SP2-2"
+            echo "VC_STATIC_HOME=${vc_static_home}"
+            echo "ICV_HOME_DIR=/home/ec2-user/synopsys/icvalidator/W-2024.09-SP5"
+            echo "SFT_ROOT=/home/ec2-user/synopsys/sft/W-2024.09-SP5-1"
+            echo "LD_LIBRARY_PATH=/home/ec2-user/synopsys/sft/W-2024.09-SP5-1/plat/xlib/Linux4.x-x86_64:${LD_LIBRARY_PATH:-}"
+            echo "SYNOPSYS_PRIMEWAVE_ENABLE_THIRDPARTY=1"
+            echo "PRIMESIM=1"
+            echo "PDK_INSTALL_PATH=/home/centos/pdk_files/65MSRFLP/PDK/TSMCiPDK/tn65cmsp007w1_1_7c"
+            echo "PDK_INSTALL_PATH_GP=/home/centos/pdk_files/65MSRFGP/PDK/TSMCiPDK/tn65cmsp018w1_1_0c"
+          } >> "$GITHUB_ENV"
+
+          printf '%s\n' "${synopsys_paths[@]}" >> "$GITHUB_PATH"
+          export PATH="$(IFS=:; echo "${synopsys_paths[*]}"):$PATH"
+          command -v vc_static_shell || true
+          command -v python3 || true
+
+      - name: Discover and run lint checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/ci/run_lint_matrix.py \
+            --changed-files .ci/changed_files.txt \
+            --max-parallel 1 \
+            --log-dir "$LOG_DIR" \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --fail-on-issues
+
+      - name: Discover and run CDC checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/ci/run_cdc_matrix.py \
+            --changed-files .ci/changed_files.txt \
+            --max-parallel 1 \
+            --log-dir "$LOG_DIR" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lint logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-logs
+          path: |
+            ${{ env.LOG_DIR }}/
+            design/rtl/**/code/lint_run/
+          if-no-files-found: warn
+          include-hidden-files: true
+
+      - name: Upload CDC logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdc-logs
+          path: |
+            ${{ env.LOG_DIR }}/
+            design/rtl/**/code/cdc_run/
+          if-no-files-found: warn
+          include-hidden-files: true
+
+  synthesis:
+    name: Synthesis
+    needs: [provision]
+    runs-on: [self-hosted, "${{ needs.provision.outputs.runner_label }}"]
+    steps:
+      - name: Prepare synthesis checks
+        shell: bash
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+          SUBMODULE_TOKEN: ${{ secrets.RUNNER_CFG_PAT }}
+        run: |
+          set -euo pipefail
+
+          git init "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          clean_origin_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_origin_url="https://x-access-token:${CHECKOUT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          trap 'git remote set-url origin "$clean_origin_url" >/dev/null 2>&1 || true' EXIT
+          if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$auth_origin_url"
+          else
+            git remote add origin "$auth_origin_url"
+          fi
+          git config --local filter.lfs.required false
+          git config --local filter.lfs.smudge cat
+          git config --local filter.lfs.clean cat
+          git config --local filter.lfs.process ""
+          git fetch --no-tags --prune origin "+${GITHUB_REF}:refs/remotes/origin/ci-checkout"
+          git checkout --force --detach refs/remotes/origin/ci-checkout
+          git clean -ffdx
+
+          git -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="https://github.com/" \
+              -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="git@github.com:" \
+              -c url."https://x-access-token:${SUBMODULE_TOKEN}@github.com/".insteadOf="ssh://git@github.com/" \
+              submodule update --init --recursive
+
+          mkdir -p .ci
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+            git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" > .ci/changed_files.txt
+            echo "Changed files:"
+            sed 's/^/  /' .ci/changed_files.txt
+          fi
+          git remote set-url origin "$clean_origin_url"
+
+          vc_static_home=/home/ec2-user/synopsys/vc_static/X-2025.06-SP2-1
+          echo "Using VC Static from ${vc_static_home}"
+
+          synopsys_paths=(
+            /usr/local/go/bin
+            /home/ec2-user/synopsys/hspice/W-2024.09-SP2-2/hspice/bin
+            /home/ec2-user/synopsys/xa/W-2024.09-SP2-2/bin
+            /home/ec2-user/synopsys/verdi/W-2024.09-1/bin
+            /home/ec2-user/synopsys/finesim/W-2024.09-SP2-2/bin
+            /home/ec2-user/synopsys/hsim/2024.06/hsimplus/bin
+            /home/ec2-user/synopsys/icvalidator/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/primesim/W-2024.09-SP2-2/bin
+            "${vc_static_home}/bin"
+            /home/ec2-user/synopsys/vcs/W-2024.09/bin
+            /home/ec2-user/synopsys/execman/W-2024.09-SP2-2/bin
+            /home/ec2-user/synopsys/icc2/W-2024.09-SP3/bin
+            /home/ec2-user/synopsys/icc/W-2024.09-SP2/bin
+            /home/ec2-user/synopsys/wv/W-2024.09-3/bin
+            /home/ec2-user/synopsys/mw/W-2024.09-SP2/bin
+            /home/ec2-user/synopsys/customcompiler/W-2024.09-3/bin
+            /home/ec2-user/synopsys/starrc/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/primewavereliability/2024.06/bin
+            /home/ec2-user/synopsys/primewave/W-2024.09-3/bin
+            /home/ec2-user/synopsys/icv_workbench/W-2024.09-SP2/bin
+            /home/ec2-user/synopsys/syn/W-2024.09-SP5-1/bin
+            /home/ec2-user/synopsys/fm/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/verdi_supp/W-2024.09-1/bin
+            /home/ec2-user/synopsys/prime/W-2024.09-SP5/bin
+            /home/ec2-user/synopsys/sft/W-2024.09-SP5-1/bin
+          )
+
+          {
+            echo "SYNOPSYS_BASE=/home/ec2-user/synopsys"
+            echo "SNPSLMD_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+            echo "LM_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+            echo "SFTLMD_LICENSE_FILE=27020@ip-172-31-2-121.ap-south-1.compute.internal"
+            echo "FLEXLM_DIAGNOSTICS=3"
+            echo "FINESIM_HOME=/home/ec2-user/synopsys/finesim/W-2024.09-SP2-2"
+            echo "VCS_HOME=/home/ec2-user/synopsys/vcs/W-2024.09"
+            echo "VERDI_HOME=/home/ec2-user/synopsys/verdi/W-2024.09-1"
+            echo "HSIM_HOME=/home/ec2-user/synopsys/hsim/2024.06/hsimplus"
+            echo "HSPICE_HOME=/home/ec2-user/synopsys/hspice/W-2024.09-SP2-2/hspice"
+            echo "PRIMESIM_HOME=/home/ec2-user/synopsys/primesim/W-2024.09-SP2-2"
+            echo "XA_HOME=/home/ec2-user/synopsys/xa/W-2024.09-SP2-2"
+            echo "VC_STATIC_HOME=${vc_static_home}"
+            echo "ICV_HOME_DIR=/home/ec2-user/synopsys/icvalidator/W-2024.09-SP5"
+            echo "SFT_ROOT=/home/ec2-user/synopsys/sft/W-2024.09-SP5-1"
+            echo "LD_LIBRARY_PATH=/home/ec2-user/synopsys/sft/W-2024.09-SP5-1/plat/xlib/Linux4.x-x86_64:${LD_LIBRARY_PATH:-}"
+            echo "SYNOPSYS_PRIMEWAVE_ENABLE_THIRDPARTY=1"
+            echo "PRIMESIM=1"
+            echo "PDK_INSTALL_PATH=/home/centos/pdk_files/65MSRFLP/PDK/TSMCiPDK/tn65cmsp007w1_1_7c"
+            echo "PDK_INSTALL_PATH_GP=/home/centos/pdk_files/65MSRFGP/PDK/TSMCiPDK/tn65cmsp018w1_1_0c"
+          } >> "$GITHUB_ENV"
+
+          printf '%s\n' "${synopsys_paths[@]}" >> "$GITHUB_PATH"
+          export PATH="$(IFS=:; echo "${synopsys_paths[*]}"):$PATH"
+          command -v vc_static_shell || true
+          command -v python3 || true
+
+      - name: Run module synthesis
+        shell: bash
+        run: |
+          set -euo pipefail
+          settings_args=()
+          if [ -n "${{ inputs.synthesis_settings }}" ]; then
+            settings_args=(--settings "${{ inputs.synthesis_settings }}")
+          fi
+          if [ -f .ci/changed_files.txt ]; then
+            settings_args+=(--changed-files .ci/changed_files.txt)
+          fi
+          python3 package/rtl-commons/synthesis/bin/run_synthesis_matrix.py \
+            --project-root . \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            "${settings_args[@]}"
+
+      - name: Upload synthesis logs and reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthesis-logs
+          retention-days: 7
+          path: |
+            design/rtl/*/pd_handoff/synthesis/*/logs_dc/
+            design/rtl/*/pd_handoff/synthesis/*/reports/
+          if-no-files-found: warn
+
+  gate:
+    name: Gate
+    needs: [initial-checks, compile, lint, synthesis]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finalize status
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.initial-checks.result }}" != "success" ]; then
+            echo "Initial checks failed."
+            exit 1
+          fi
+          if [ "${{ needs.compile.result }}" != "success" ]; then
+            echo "One or more compile checks failed."
+            exit 1
+          fi
+          if [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "One or more lint or CDC checks failed."
+            exit 1
+          fi
+          if [ "${{ needs.synthesis.result }}" != "success" ]; then
+            echo "Sanity or synthesis checks failed."
+            exit 1
+          fi
+          echo "Compile, coverage, lint, CDC, sanity and synthesis checks completed successfully."
+
+  cleanup:
+    name: Stop EC2 runner
+    needs: [compile, lint, synthesis, provision]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        if: ${{ needs.provision.outputs.ec2_instance_id != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # GitHub can take a few seconds to release a runner after its last job.
+      # Remove the runner before terminating its instance, and retry while it is
+      # still marked busy.  This makes cleanup safe to retry as well.
+      - name: Remove GitHub runner
+        if: ${{ needs.provision.outputs.ec2_instance_id != '' }}
+        shell: bash
+        env:
+          RUNNER_TOKEN: ${{ secrets.RUNNER_CFG_PAT }}
+          RUNNER_LABEL: ${{ needs.provision.outputs.runner_label }}
+        run: |
+          set -euo pipefail
+          runner_name="ec2-${RUNNER_LABEL}"
+
+          for attempt in {1..18}; do
+            runner="$(curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer ${RUNNER_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100" \
+              | jq --arg name "$runner_name" '[.runners[] | select(.name == $name)] | first')"
+
+            if [ "$runner" = "null" ]; then
+              echo "Runner ${runner_name} is already removed."
+              exit 0
+            fi
+
+            runner_id="$(jq -r '.id' <<<"$runner")"
+            if [ "$(jq -r '.busy' <<<"$runner")" = "true" ]; then
+              echo "Runner ${runner_name} is still busy (attempt ${attempt}/18)."
+              sleep 5
+              continue
+            fi
+
+            if curl --fail-with-body --silent --show-error --request DELETE \
+              --header "Authorization: Bearer ${RUNNER_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners/${runner_id}"; then
+              echo "Removed GitHub runner ${runner_name}."
+              exit 0
+            fi
+
+            echo "Runner removal was not accepted yet (attempt ${attempt}/18)."
+            sleep 5
+          done
+
+          echo "Runner ${runner_name} did not become removable within 90 seconds."
+          exit 1
+
+      - name: Terminate EC2 runner
+        if: ${{ needs.provision.outputs.ec2_instance_id != '' }}
+        shell: bash
+        env:
+          EC2_INSTANCE_ID: ${{ needs.provision.outputs.ec2_instance_id }}
+        run: |
+          set -euo pipefail
+          state="$(aws ec2 describe-instances --instance-ids "$EC2_INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)"
+
+          if [ -z "$state" ] || [ "$state" = "None" ] || [ "$state" = "terminated" ]; then
+            echo "EC2 instance ${EC2_INSTANCE_ID} is already gone."
+            exit 0
+          fi
+
+          aws ec2 terminate-instances --instance-ids "$EC2_INSTANCE_ID" >/dev/null
+          echo "Requested termination of EC2 instance ${EC2_INSTANCE_ID}."

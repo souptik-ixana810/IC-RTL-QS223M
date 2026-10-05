@@ -1,0 +1,3 @@
+# Store module SPICE handoff netlists with Git LFS.
+design/rtl/*/pd_handoff/spice_files/*.sp filter=lfs diff=lfs merge=lfs -text
+design/rtl/*/pd_handoff/spice_files/**/*.sp filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,7 @@
+[submodule "package/rtl-commons"]
+	path = package/rtl-commons
+	url = https://github.com/Quasistatics/IC-RTL-COMMON.git
+	branch = main
+[submodule "package/rtl-liteuvm"]
+	path = package/rtl-liteuvm
+	url = https://github.com/Quasistatics/rtl-liteuvm.git

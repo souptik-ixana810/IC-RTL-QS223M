@@ -1,0 +1,7 @@
+# One allowed external path prefix per line.
+/home/centos/SClib/
+/home/ec2-user/synopsys/
+/home/centos/pdk_files/
+/home/centos/pdk_files/65MSRFLP/
+/home/centos/pdk_files/65MSRFGP/
+/rtl/
